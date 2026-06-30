@@ -1,62 +1,107 @@
 import sys
 import json
 import os
-import face_recognition
+import cv2
+import numpy as np
+
+FACE_SIZE = (200, 200)
+# Skor LBPH = jarak (semakin kecil semakin mirip). Di atas ini dianggap "tidak dikenal".
+DISTANCE_THRESHOLD = 70
+
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
 
-def encode_known_faces(uploads_dir):
-    """Encode semua foto yang sudah terdaftar di folder uploads"""
-    known_encodings = []
-    known_data = []
+def extract_face(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
 
-    for filename in os.listdir(uploads_dir):
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            filepath = os.path.join(uploads_dir, filename)
-            try:
-                image = face_recognition.load_image_file(filepath)
-                encodings = face_recognition.face_encodings(image)
-                if len(encodings) > 0:
-                    known_encodings.append(encodings[0])
-                    known_data.append(filename)
-            except Exception:
-                continue
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
 
-    return known_encodings, known_data
+    faces = face_cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+    )
+    if len(faces) == 0:
+        return None
+
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+    x, y, w, h = faces[0]
+    face = gray[y:y + h, x:x + w]
+    face = cv2.resize(face, FACE_SIZE)
+    return face
 
 
-def recognize_face(scan_image_path, uploads_dir):
-    unknown_image = face_recognition.load_image_file(scan_image_path)
-    unknown_encodings = face_recognition.face_encodings(unknown_image)
+def main():
+    if len(sys.argv) < 3:
+        print(json.dumps({"status": "error", "message": "Argumen tidak lengkap"}))
+        return
 
-    if len(unknown_encodings) == 0:
-        return {"status": "error", "message": "Wajah tidak terdeteksi pada gambar"}
+    scan_path = sys.argv[1]
+    uploads_dir = sys.argv[2]
 
-    unknown_encoding = unknown_encodings[0]
+    if not os.path.isfile(scan_path):
+        print(json.dumps({"status": "error", "message": "File scan tidak ditemukan"}))
+        return
 
-    known_encodings, known_data = encode_known_faces(uploads_dir)
+    if not os.path.isdir(uploads_dir):
+        print(json.dumps({"status": "error", "message": "Folder uploads tidak ditemukan"}))
+        return
 
-    if len(known_encodings) == 0:
-        return {"status": "error", "message": "Belum ada data wajah terdaftar"}
+    scan_face = extract_face(scan_path)
+    if scan_face is None:
+        print(json.dumps({"status": "error", "message": "Wajah tidak terdeteksi pada hasil scan"}))
+        return
 
-    results = face_recognition.compare_faces(known_encodings, unknown_encoding, tolerance=0.5)
-    distances = face_recognition.face_distance(known_encodings, unknown_encoding)
+    valid_ext = (".jpg", ".jpeg", ".png")
+    filenames = [f for f in os.listdir(uploads_dir) if f.lower().endswith(valid_ext)]
 
-    if True in results:
-        best_match_index = distances.argmin()
-        if results[best_match_index]:
-            matched_file = known_data[best_match_index]
-            return {
-                "status": "success",
-                "filename": matched_file,
-                "confidence": float(1 - distances[best_match_index])
-            }
+    if not filenames:
+        print(json.dumps({"status": "error", "message": "Belum ada data wajah terdaftar"}))
+        return
 
-    return {"status": "not_found", "message": "Wajah tidak dikenali / tidak cocok dengan data manapun"}
+    train_faces = []
+    labels = []
+    label_to_filename = {}
+
+    for idx, fname in enumerate(filenames):
+        fpath = os.path.join(uploads_dir, fname)
+        face = extract_face(fpath)
+        if face is None:
+            continue
+        train_faces.append(face)
+        labels.append(idx)
+        label_to_filename[idx] = fname
+
+    if not train_faces:
+        print(json.dumps({"status": "error", "message": "Tidak ada wajah valid di data terdaftar"}))
+        return
+
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer.train(train_faces, np.array(labels))
+
+    predicted_label, distance = recognizer.predict(scan_face)
+
+    if distance > DISTANCE_THRESHOLD:
+        print(json.dumps({
+            "status": "not_found",
+            "message": "Wajah tidak dikenali",
+            "distance": float(distance)
+        }))
+        return
+
+    # Konversi distance (semakin kecil semakin bagus) jadi confidence 0..1 (semakin besar semakin bagus)
+    confidence = max(0.0, 1.0 - (distance / DISTANCE_THRESHOLD))
+
+    print(json.dumps({
+        "status": "success",
+        "filename": label_to_filename[predicted_label],
+        "confidence": round(confidence, 4),
+        "distance": float(distance)
+    }))
 
 
 if __name__ == "__main__":
-    scan_image_path = sys.argv[1]
-    uploads_dir = sys.argv[2]
-
-    result = recognize_face(scan_image_path, uploads_dir)
-    print(json.dumps(result))
+    main()
